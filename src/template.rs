@@ -7,7 +7,6 @@ use instruction::{Instruction, PathSlice, PathStep};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::slice;
 use ValueFormatter;
 
 /// Enum defining the different kinds of records on the context stack.
@@ -17,16 +16,27 @@ enum ContextElement<'render, 'template> {
     Object(&'render Value),
     /// Named contexts shadow only one name. Any path that starts with that name is looked up in
     /// this object, and all others are passed on down the stack.
-    Named(&'template str, &'render Value),
+    Named(&'template str, Value),
     /// Iteration contexts shadow one name with the current value of the iteration. They also
-    /// store the iteration state. The two usizes are the index of the current value and the length
-    /// of the array that we're iterating over.
+    /// store the iteration state. We store the array data index and current position.
     Iteration(
-        &'template str,
-        &'render Value,
-        usize,
-        usize,
-        slice::Iter<'render, Value>,
+        &'template str, // name
+        Value,          // current value (owned)
+        usize,          // current index in the iteration
+        usize,          // total length of the iteration
+        usize,          // index in temp_arrays where the data is stored
+        usize,          // current position in the array
+    ),
+    /// Range iteration contexts shadow one name with the current value of a numeric range.
+    /// The fields are: name, current_value, current_index, total_length, current_number, end_number, inclusive_flag
+    RangeIteration(
+        &'template str, // name
+        Value,          // current value
+        usize,          // current index in the iteration
+        usize,          // total length of the iteration
+        i64,            // current number
+        i64,            // end number
+        bool,           // inclusive flag
     ),
 }
 
@@ -35,11 +45,13 @@ enum ContextElement<'render, 'template> {
 struct RenderContext<'render, 'template> {
     original_text: &'template str,
     context_stack: Vec<ContextElement<'render, 'template>>,
+    // Temporary storage for cloned iteration arrays
+    temp_arrays: Vec<Vec<Value>>,
 }
 impl<'render, 'template> RenderContext<'render, 'template> {
     /// Look up the given path in the context stack and return the value (if found) or an error (if
     /// not)
-    fn lookup(&self, path: PathSlice) -> Result<&'render Value> {
+    fn lookup<'a>(&'a self, path: PathSlice) -> Result<&'a Value> {
         for stack_layer in self.context_stack.iter().rev() {
             match stack_layer {
                 ContextElement::Object(obj) => return self.lookup_in(path, obj),
@@ -48,9 +60,14 @@ impl<'render, 'template> RenderContext<'render, 'template> {
                         return self.lookup_in(&path[1..], obj);
                     }
                 }
-                ContextElement::Iteration(name, obj, _, _, _) => {
+                ContextElement::Iteration(name, obj, _, _, _, _) => {
                     if *name == &*path[0] {
                         return self.lookup_in(&path[1..], obj);
+                    }
+                }
+                ContextElement::RangeIteration(name, current_value, _, _, _, _, _) => {
+                    if *name == &*path[0] {
+                        return self.lookup_in(&path[1..], current_value);
                     }
                 }
             }
@@ -60,7 +77,7 @@ impl<'render, 'template> RenderContext<'render, 'template> {
 
     /// Look up a path within a given value object and return the resulting value (if found) or
     /// an error (if not)
-    fn lookup_in(&self, path: PathSlice, object: &'render Value) -> Result<&'render Value> {
+    fn lookup_in<'a>(&'a self, path: PathSlice, object: &'a Value) -> Result<&'a Value> {
         let mut current = object;
         for step in path.iter() {
             if let PathStep::Index(_, n) = step {
@@ -84,7 +101,12 @@ impl<'render, 'template> RenderContext<'render, 'template> {
     fn lookup_index(&self) -> Result<(usize, usize)> {
         for stack_layer in self.context_stack.iter().rev() {
             match stack_layer {
-                ContextElement::Iteration(_, _, index, length, _) => return Ok((*index, *length)),
+                ContextElement::Iteration(_, _, index, length, _, _) => {
+                    return Ok((*index, *length))
+                }
+                ContextElement::RangeIteration(_, _, index, length, _, _, _) => {
+                    return Ok((*index, *length))
+                }
                 _ => continue,
             }
         }
@@ -117,7 +139,7 @@ pub(crate) struct Template<'template> {
 }
 impl<'template> Template<'template> {
     /// Create a Template from the given template string.
-    pub fn compile(text: &'template str) -> Result<Template> {
+    pub fn compile(text: &'template str) -> Result<Template<'template>> {
         Ok(Template {
             original_text: text,
             template_len: text.len(),
@@ -159,6 +181,7 @@ impl<'template> Template<'template> {
         let mut render_context = RenderContext {
             original_text: self.original_text,
             context_stack: vec![ContextElement::Object(context)],
+            temp_arrays: Vec::new(),
         };
 
         while program_counter < self.instructions.len() {
@@ -244,35 +267,80 @@ impl<'template> Template<'template> {
                     }
                 }
                 Instruction::PushNamedContext(path, name) => {
-                    let context_value = render_context.lookup(path)?;
+                    // Clone the value to avoid borrowing conflicts
+                    let context_value = render_context.lookup(path)?.clone();
+
                     render_context
                         .context_stack
                         .push(ContextElement::Named(name, context_value));
                     program_counter += 1;
                 }
                 Instruction::PushIterationContext(path, name) => {
-                    // We push a context with an invalid index and no value and then wait for the
-                    // following Iterate instruction to set the index and value properly.
+                    // Get the context value and clone it to avoid borrowing conflicts
                     let first = path.first().unwrap();
                     let context_value = match first {
-                        PathStep::Name("@root") => render_context.lookup_root()?,
+                        PathStep::Name("@root") => render_context.lookup_root()?.clone(),
                         PathStep::Name(other) if other.starts_with('@') => {
                             return Err(not_iterable_error(self.original_text, path))
                         }
-                        _ => render_context.lookup(path)?,
+                        _ => render_context.lookup(path)?.clone(),
                     };
+
                     match context_value {
-                        Value::Array(ref arr) => {
+                        Value::Array(arr) => {
+                            // Store the cloned array in temp storage
+                            let arr_len = arr.len();
+                            let array_index = render_context.temp_arrays.len();
+                            render_context.temp_arrays.push(arr);
+
+                            // Create iteration context with owned current value
                             render_context.context_stack.push(ContextElement::Iteration(
                                 name,
-                                &Value::Null,
-                                ::std::usize::MAX,
-                                arr.len(),
-                                arr.iter(),
-                            ))
+                                Value::Null, // current value (will be set by Iterate)
+                                ::std::usize::MAX, // current index (will be set by Iterate)
+                                arr_len,     // total length
+                                array_index, // index in temp_arrays
+                                ::std::usize::MAX, // current position (will be set by Iterate)
+                            ));
                         }
                         _ => return Err(not_iterable_error(self.original_text, path)),
                     };
+                    program_counter += 1;
+                }
+                Instruction::PushRangeIterationContext {
+                    start,
+                    end,
+                    inclusive,
+                    name,
+                } => {
+                    // Calculate the total length of the range
+                    let length = if *inclusive {
+                        if *end >= *start {
+                            (*end - *start + 1) as usize
+                        } else {
+                            0
+                        }
+                    } else {
+                        if *end > *start {
+                            (*end - *start) as usize
+                        } else {
+                            0
+                        }
+                    };
+
+                    // Range iteration doesn't need external lookup - it's completely self-contained
+                    // Push a range iteration context directly
+                    render_context
+                        .context_stack
+                        .push(ContextElement::RangeIteration(
+                            name,
+                            Value::Null,       // current value (will be set by Iterate)
+                            ::std::usize::MAX, // current index (will be set by Iterate)
+                            length,            // total length
+                            *start,            // current number (will be used by Iterate)
+                            *end,              // end number
+                            *inclusive,        // inclusive flag
+                        ));
                     program_counter += 1;
                 }
                 Instruction::PopContext => {
@@ -284,32 +352,70 @@ impl<'template> Template<'template> {
                 }
                 Instruction::Iterate(target) => {
                     match render_context.context_stack.last_mut() {
-                        Some(ContextElement::Iteration(_, val, index, _, iter)) => {
-                            match iter.next() {
-                                Some(new_val) => {
-                                    *val = new_val;
-                                    // On the first iteration, this will be usize::MAX so it will
-                                    // wrap around to zero.
-                                    *index = index.wrapping_add(1);
-                                    program_counter += 1;
-                                }
-                                None => {
-                                    program_counter = *target;
-                                }
+                        Some(ContextElement::Iteration(
+                            _,
+                            current_value,
+                            index,
+                            _length,
+                            array_index,
+                            position,
+                        )) => {
+                            // Advance position (on first iteration, MAX + 1 wraps to 0)
+                            *position = position.wrapping_add(1);
+
+                            // Check if we have more elements
+                            if *position < render_context.temp_arrays[*array_index].len() {
+                                // Update current value and index
+                                *current_value =
+                                    render_context.temp_arrays[*array_index][*position].clone();
+                                *index = index.wrapping_add(1);
+                                program_counter += 1;
+                            } else {
+                                // Array exhausted, jump to target
+                                program_counter = *target;
+                            }
+                        }
+                        Some(ContextElement::RangeIteration(
+                            _,
+                            current_value,
+                            index,
+                            _len,
+                            current,
+                            end,
+                            inclusive,
+                        )) => {
+                            // Check if we've reached the end (Rust semantics: 0..100 excludes end; 0..=100 includes end)
+                            let done = if *inclusive {
+                                *current > *end
+                            } else {
+                                *current >= *end
+                            };
+
+                            if done {
+                                program_counter = *target;
+                            } else {
+                                // Update the current value
+                                *current_value = Value::Number(serde_json::Number::from(*current));
+
+                                // Update iteration state
+                                *index = index.wrapping_add(1);
+                                *current += 1;
+
+                                program_counter += 1;
                             }
                         }
                         _ => panic!("Malformed program."),
                     };
                 }
                 Instruction::Call(template_name, path) => {
-                    let context_value = match path[0] {
-                        PathStep::Name("@root") => render_context.lookup_root()?,
-                        _ => render_context.lookup(path)?,
+                    let context_value = match path.first().unwrap() {
+                        PathStep::Name("@root") => render_context.lookup_root()?.clone(),
+                        _ => render_context.lookup(path)?.clone(),
                     };
                     match template_registry.get(template_name) {
                         Some(templ) => {
                             let called_templ_result = templ.render_into(
-                                context_value,
+                                &context_value,
                                 template_registry,
                                 formatter_registry,
                                 default_formatter,
@@ -420,7 +526,7 @@ mod test {
 
     fn other_templates() -> HashMap<&'static str, Template<'static>> {
         let mut map = HashMap::new();
-        map.insert("my_macro", compile("{value}"));
+        map.insert("my_macro", compile("${value}"));
         map
     }
 
@@ -460,7 +566,7 @@ mod test {
 
     #[test]
     fn test_value() {
-        let template = compile("{ number }");
+        let template = compile("${ number }");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -477,7 +583,7 @@ mod test {
 
     #[test]
     fn test_path() {
-        let template = compile("The number of the day is { nested.value }.");
+        let template = compile("The number of the day is ${ nested.value }.");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -494,7 +600,7 @@ mod test {
 
     #[test]
     fn test_if_taken() {
-        let template = compile("{{ if boolean }}Hello!{{ endif }}");
+        let template = compile("${{ if boolean }}Hello!${{ endif }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -511,7 +617,7 @@ mod test {
 
     #[test]
     fn test_if_untaken() {
-        let template = compile("{{ if null }}Hello!{{ endif }}");
+        let template = compile("${{ if null }}Hello!${{ endif }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -528,7 +634,7 @@ mod test {
 
     #[test]
     fn test_if_else_taken() {
-        let template = compile("{{ if boolean }}Hello!{{ else }}Goodbye!{{ endif }}");
+        let template = compile("${{ if boolean }}Hello!${{ else }}Goodbye!${{ endif }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -545,7 +651,7 @@ mod test {
 
     #[test]
     fn test_if_else_untaken() {
-        let template = compile("{{ if null }}Hello!{{ else }}Goodbye!{{ endif }}");
+        let template = compile("${{ if null }}Hello!${{ else }}Goodbye!${{ endif }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -562,7 +668,7 @@ mod test {
 
     #[test]
     fn test_ifnot_taken() {
-        let template = compile("{{ if not boolean }}Hello!{{ endif }}");
+        let template = compile("${{ if not boolean }}Hello!${{ endif }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -579,7 +685,7 @@ mod test {
 
     #[test]
     fn test_ifnot_untaken() {
-        let template = compile("{{ if not null }}Hello!{{ endif }}");
+        let template = compile("${{ if not null }}Hello!${{ endif }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -596,7 +702,7 @@ mod test {
 
     #[test]
     fn test_ifnot_else_taken() {
-        let template = compile("{{ if not boolean }}Hello!{{ else }}Goodbye!{{ endif }}");
+        let template = compile("${{ if not boolean }}Hello!${{ else }}Goodbye!${{ endif }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -613,7 +719,7 @@ mod test {
 
     #[test]
     fn test_ifnot_else_untaken() {
-        let template = compile("{{ if not null }}Hello!{{ else }}Goodbye!{{ endif }}");
+        let template = compile("${{ if not null }}Hello!${{ else }}Goodbye!${{ endif }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -631,7 +737,7 @@ mod test {
     #[test]
     fn test_nested_ifs() {
         let template = compile(
-            "{{ if boolean }}Hi, {{ if null }}there!{{ else }}Hello!{{ endif }}{{ endif }}",
+            "${{ if boolean }}Hi, ${{ if null }}there!${{ else }}Hello!${{ endif }}${{ endif }}",
         );
         let context = context();
         let template_registry = other_templates();
@@ -649,7 +755,7 @@ mod test {
 
     #[test]
     fn test_with() {
-        let template = compile("{{ with nested as n }}{ n.value } { number }{{endwith}}");
+        let template = compile("${{ with nested as n }}${ n.value } ${ number }${{endwith}}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -666,7 +772,7 @@ mod test {
 
     #[test]
     fn test_for_loop() {
-        let template = compile("{{ for a in array }}{ a }{{ endfor }}");
+        let template = compile("${{ for a in array }}${ a }${{ endfor }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -683,7 +789,7 @@ mod test {
 
     #[test]
     fn test_for_loop_index() {
-        let template = compile("{{ for a in array }}{ @index }{{ endfor }}");
+        let template = compile("${{ for a in array }}${ @index }${{ endfor }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -701,7 +807,7 @@ mod test {
     #[test]
     fn test_for_loop_first() {
         let template =
-            compile("{{ for a in array }}{{if @first }}{ @index }{{ endif }}{{ endfor }}");
+            compile("${{ for a in array }}${{if @first }}${ @index }${{ endif }}${{ endfor }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -719,7 +825,7 @@ mod test {
     #[test]
     fn test_for_loop_last() {
         let template =
-            compile("{{ for a in array }}{{ if @last}}{ @index }{{ endif }}{{ endfor }}");
+            compile("${{ for a in array }}${{ if @last}}${ @index }${{ endif }}${{ endfor }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -736,7 +842,7 @@ mod test {
 
     #[test]
     fn test_whitespace_stripping_value() {
-        let template = compile("1  \n\t   {- number -}  \n   1");
+        let template = compile("1  \n\t   ${- number -}  \n   1");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -753,7 +859,7 @@ mod test {
 
     #[test]
     fn test_call() {
-        let template = compile("{{ call my_macro with nested }}");
+        let template = compile("${{ call my_macro with nested }}");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -770,7 +876,7 @@ mod test {
 
     #[test]
     fn test_formatter() {
-        let template = compile("{ nested.value | my_formatter }");
+        let template = compile("${ nested.value | my_formatter }");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -787,7 +893,7 @@ mod test {
 
     #[test]
     fn test_unknown() {
-        let template = compile("{ foobar }");
+        let template = compile("${ foobar }");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -803,7 +909,7 @@ mod test {
 
     #[test]
     fn test_escaping() {
-        let template = compile("{ escapes }");
+        let template = compile("${ escapes }");
         let context = context();
         let template_registry = other_templates();
         let formatter_registry = formatters();
@@ -820,7 +926,7 @@ mod test {
 
     #[test]
     fn test_unescaped() {
-        let template = compile("{ escapes | unescaped }");
+        let template = compile("${ escapes | unescaped }");
         let context = context();
         let template_registry = other_templates();
         let mut formatter_registry = formatters();
@@ -838,7 +944,7 @@ mod test {
 
     #[test]
     fn test_root_print() {
-        let template = compile("{ @root }");
+        let template = compile("${ @root }");
         let context = "Hello World!";
         let context = ::serde_json::to_value(&context).unwrap();
         let template_registry = other_templates();
@@ -856,7 +962,7 @@ mod test {
 
     #[test]
     fn test_root_branch() {
-        let template = compile("{{ if @root }}Hello World!{{ endif }}");
+        let template = compile("${{ if @root }}Hello World!${{ endif }}");
         let context = true;
         let context = ::serde_json::to_value(&context).unwrap();
         let template_registry = other_templates();
@@ -874,7 +980,7 @@ mod test {
 
     #[test]
     fn test_root_iterate() {
-        let template = compile("{{ for a in @root }}{ a }{{ endfor }}");
+        let template = compile("${{ for a in @root }}${ a }${{ endfor }}");
         let context = vec!["foo", "bar"];
         let context = ::serde_json::to_value(&context).unwrap();
         let template_registry = other_templates();
@@ -892,7 +998,7 @@ mod test {
 
     #[test]
     fn test_number_truthiness_zero() {
-        let template = compile("{{ if @root }}truthy{{else}}not truthy{{ endif }}");
+        let template = compile("${{ if @root }}truthy${{else}}not truthy${{ endif }}");
         let context = 0;
         let context = ::serde_json::to_value(&context).unwrap();
         let template_registry = other_templates();
@@ -910,7 +1016,7 @@ mod test {
 
     #[test]
     fn test_number_truthiness_one() {
-        let template = compile("{{ if @root }}truthy{{else}}not truthy{{ endif }}");
+        let template = compile("${{ if @root }}truthy${{else}}not truthy${{ endif }}");
         let context = 1;
         let context = ::serde_json::to_value(&context).unwrap();
         let template_registry = other_templates();
@@ -933,7 +1039,7 @@ mod test {
             foo: (usize, usize),
         }
 
-        let template = compile("{ foo.1 }{ foo.0 }");
+        let template = compile("${ foo.1 }${ foo.0 }");
         let context = Context { foo: (123, 456) };
         let context = ::serde_json::to_value(&context).unwrap();
         let template_registry = other_templates();
@@ -956,7 +1062,7 @@ mod test {
             foo: HashMap<&'static str, usize>,
         }
 
-        let template = compile("{ foo.1 }{ foo.0 }");
+        let template = compile("${ foo.1 }${ foo.0 }");
         let mut foo = HashMap::new();
         foo.insert("0", 123);
         foo.insert("1", 456);
@@ -973,5 +1079,90 @@ mod test {
             )
             .unwrap();
         assert_eq!("456123", &string);
+    }
+
+    #[test]
+    fn test_for_range_exclusive() {
+        let template = compile("${{ for i in 0..5 }}${ i }${{ endfor }}");
+        let context = ::serde_json::to_value(&()).unwrap();
+        let template_registry = other_templates();
+        let formatter_registry = formatters();
+        let string = template
+            .render(
+                &context,
+                &template_registry,
+                &formatter_registry,
+                &default_formatter(),
+            )
+            .unwrap();
+        assert_eq!("01234", &string);
+    }
+
+    #[test]
+    fn test_for_range_inclusive() {
+        let template = compile("${{ for i in 0..=3 }}${ i }${{ endfor }}");
+        let context = ::serde_json::to_value(&()).unwrap();
+        let template_registry = other_templates();
+        let formatter_registry = formatters();
+        let string = template
+            .render(
+                &context,
+                &template_registry,
+                &formatter_registry,
+                &default_formatter(),
+            )
+            .unwrap();
+        assert_eq!("0123", &string);
+    }
+
+    #[test]
+    fn test_for_range_negative() {
+        let template = compile("${{ for i in -2..2 }}${ i }${{ endfor }}");
+        let context = ::serde_json::to_value(&()).unwrap();
+        let template_registry = other_templates();
+        let formatter_registry = formatters();
+        let string = template
+            .render(
+                &context,
+                &template_registry,
+                &formatter_registry,
+                &default_formatter(),
+            )
+            .unwrap();
+        assert_eq!("-2-101", &string);
+    }
+
+    #[test]
+    fn test_for_range_with_index() {
+        let template = compile("${{ for i in 0..3 }}${ @index }:${ i } ${{ endfor }}");
+        let context = ::serde_json::to_value(&()).unwrap();
+        let template_registry = other_templates();
+        let formatter_registry = formatters();
+        let string = template
+            .render(
+                &context,
+                &template_registry,
+                &formatter_registry,
+                &default_formatter(),
+            )
+            .unwrap();
+        assert_eq!("0:0 1:1 2:2 ", &string);
+    }
+
+    #[test]
+    fn test_for_range_empty() {
+        let template = compile("${{ for i in 5..5 }}${ i }${{ endfor }}");
+        let context = ::serde_json::to_value(&()).unwrap();
+        let template_registry = other_templates();
+        let formatter_registry = formatters();
+        let string = template
+            .render(
+                &context,
+                &template_registry,
+                &formatter_registry,
+                &default_formatter(),
+            )
+            .unwrap();
+        assert_eq!("", &string);
     }
 }

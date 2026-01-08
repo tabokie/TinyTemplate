@@ -23,6 +23,19 @@ enum Block {
 /// List of the known @-keywords so that we can error if the user spells them wrong.
 static KNOWN_KEYWORDS: [&str; 4] = ["@index", "@first", "@last", "@root"];
 
+/// Enum representing the different kinds of data sources for for-loops
+#[derive(Debug, Clone)]
+enum ForSource<'template> {
+    /// A path to a value in the context (e.g., "items" or "user.posts")
+    Path(Path<'template>),
+    /// A numeric range (e.g., "0..10" or "1..=5")
+    Range {
+        start: i64,
+        end: i64,
+        inclusive: bool,
+    },
+}
+
 /// The TemplateCompiler struct is responsible for parsing a template string and generating bytecode
 /// instructions based on it. The parser is a simple hand-written pattern-matching parser with no
 /// recursion, which makes it relatively easy to read.
@@ -56,6 +69,9 @@ impl<'template> TemplateCompiler<'template> {
                 self.trim_next = false;
 
                 let tag = self.consume_tag("#}")?;
+                if tag.len() < 5 {
+                    return Err(self.parse_error(tag, "Malformed comment tag".to_string()));
+                }
                 let comment = tag[3..(tag.len() - 2)].trim();
                 if comment.starts_with('-') {
                     self.trim_last_whitespace();
@@ -68,15 +84,16 @@ impl<'template> TemplateCompiler<'template> {
             } else if self.remaining_text.starts_with("${{") {
                 self.trim_next = false;
 
-                let (discriminant, mut rest) = self.consume_block()?;
+                let (discriminant, rest) = self.consume_block()?;
                 match discriminant {
                     "if" => {
                         let mut negated = false;
+                        let mut equal = None;
+                        let mut rest = rest;
                         if rest.starts_with("not") {
                             rest = &rest[4..];
                             negated = true;
                         }
-                        let mut equal = None;
                         if let Some(operator) = rest.find("==") {
                             equal = Some(rest[operator + 2..].trim());
                             rest = &rest[..operator].trim();
@@ -118,9 +135,26 @@ impl<'template> TemplateCompiler<'template> {
                         }
                     }
                     "for" => {
-                        let (path, name) = self.parse_for(rest)?;
-                        self.instructions
-                            .push(Instruction::PushIterationContext(path, name));
+                        let (source, name) = self.parse_for(rest)?;
+                        match source {
+                            ForSource::Path(path) => {
+                                self.instructions
+                                    .push(Instruction::PushIterationContext(path, name));
+                            }
+                            ForSource::Range {
+                                start,
+                                end,
+                                inclusive,
+                            } => {
+                                self.instructions
+                                    .push(Instruction::PushRangeIterationContext {
+                                        start,
+                                        end,
+                                        inclusive,
+                                        name,
+                                    });
+                            }
+                        }
                         self.block_stack
                             .push((discriminant, Block::For(self.instructions.len())));
                         self.instructions.push(Instruction::Iterate(UNKNOWN));
@@ -405,13 +439,49 @@ impl<'template> TemplateCompiler<'template> {
         }
     }
 
-    /// Parse a for tag to separate the value path from the name.
-    fn parse_for(&self, for_text: &'template str) -> Result<(Path<'template>, &'template str)> {
+    /// Parse a range literal of the form "start..end" or "start..=end"
+    fn parse_range_literal(&self, s: &str) -> Option<(i64, i64, bool)> {
+        let s = s.trim();
+
+        // Support ".." or "..="
+        let (lhs, rhs, inclusive) = if let Some(pos) = s.find("..=") {
+            (&s[..pos], &s[pos + 3..], true)
+        } else if let Some(pos) = s.find("..") {
+            (&s[..pos], &s[pos + 2..], false)
+        } else {
+            return None;
+        };
+
+        let start: i64 = lhs.trim().parse().ok()?;
+        let end: i64 = rhs.trim().parse().ok()?;
+        Some((start, end, inclusive))
+    }
+
+    /// Parse a for tag to separate the value source (path or range) from the name.
+    fn parse_for(
+        &self,
+        for_text: &'template str,
+    ) -> Result<(ForSource<'template>, &'template str)> {
         if let Some(index) = for_text.find(" in ") {
-            let (name_str, path_str) = for_text.split_at(index);
+            let (name_str, rhs_str) = for_text.split_at(index);
             let name = name_str.trim();
-            let path = self.parse_path(path_str[" in ".len()..].trim())?;
-            Ok((path, name))
+            let rhs = rhs_str[" in ".len()..].trim();
+
+            // Try to parse as a range first
+            if let Some((start, end, inclusive)) = self.parse_range_literal(rhs) {
+                Ok((
+                    ForSource::Range {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                    name,
+                ))
+            } else {
+                // Fall back to parsing as a path
+                let path = self.parse_path(rhs)?;
+                Ok((ForSource::Path(path), name))
+            }
         } else {
             Err(self.parse_error(
                 for_text,
@@ -455,7 +525,7 @@ mod test {
 
     #[test]
     fn test_compile_value() {
-        let text = "{ foobar }";
+        let text = "${ foobar }";
         let instructions = compile(text).unwrap();
         assert_eq!(1, instructions.len());
         assert_eq!(&Value(vec![PathStep::Name("foobar")]), &instructions[0]);
@@ -463,7 +533,7 @@ mod test {
 
     #[test]
     fn test_compile_value_with_formatter() {
-        let text = "{ foobar | my_formatter }";
+        let text = "${ foobar | my_formatter }";
         let instructions = compile(text).unwrap();
         assert_eq!(1, instructions.len());
         assert_eq!(
@@ -474,7 +544,7 @@ mod test {
 
     #[test]
     fn test_dotted_path() {
-        let text = "{ foo.bar }";
+        let text = "${ foo.bar }";
         let instructions = compile(text).unwrap();
         assert_eq!(1, instructions.len());
         assert_eq!(
@@ -485,7 +555,7 @@ mod test {
 
     #[test]
     fn test_indexed_path() {
-        let text = "{ foo.0.bar }";
+        let text = "${ foo.0.bar }";
         let instructions = compile(text).unwrap();
         assert_eq!(1, instructions.len());
         assert_eq!(
@@ -500,7 +570,7 @@ mod test {
 
     #[test]
     fn test_mixture() {
-        let text = "Hello { name }, how are you?";
+        let text = "Hello ${ name }, how are you?";
         let instructions = compile(text).unwrap();
         assert_eq!(3, instructions.len());
         assert_eq!(&Literal("Hello "), &instructions[0]);
@@ -510,11 +580,11 @@ mod test {
 
     #[test]
     fn test_if_endif() {
-        let text = "{{ if foo }}Hello!{{ endif }}";
+        let text = "${{ if foo }}Hello!${{ endif }}";
         let instructions = compile(text).unwrap();
         assert_eq!(2, instructions.len());
         assert_eq!(
-            &Branch(vec![PathStep::Name("foo")], true, 2),
+            &Branch(vec![PathStep::Name("foo")], None, true, 2),
             &instructions[0]
         );
         assert_eq!(&Literal("Hello!"), &instructions[1]);
@@ -522,11 +592,11 @@ mod test {
 
     #[test]
     fn test_if_not_endif() {
-        let text = "{{ if not foo }}Hello!{{ endif }}";
+        let text = "${{ if not foo }}Hello!${{ endif }}";
         let instructions = compile(text).unwrap();
         assert_eq!(2, instructions.len());
         assert_eq!(
-            &Branch(vec![PathStep::Name("foo")], false, 2),
+            &Branch(vec![PathStep::Name("foo")], None, false, 2),
             &instructions[0]
         );
         assert_eq!(&Literal("Hello!"), &instructions[1]);
@@ -534,11 +604,11 @@ mod test {
 
     #[test]
     fn test_if_else_endif() {
-        let text = "{{ if foo }}Hello!{{ else }}Goodbye!{{ endif }}";
+        let text = "${{ if foo }}Hello!${{ else }}Goodbye!${{ endif }}";
         let instructions = compile(text).unwrap();
         assert_eq!(4, instructions.len());
         assert_eq!(
-            &Branch(vec![PathStep::Name("foo")], true, 3),
+            &Branch(vec![PathStep::Name("foo")], None, true, 3),
             &instructions[0]
         );
         assert_eq!(&Literal("Hello!"), &instructions[1]);
@@ -548,7 +618,7 @@ mod test {
 
     #[test]
     fn test_with() {
-        let text = "{{ with foo as bar }}Hello!{{ endwith }}";
+        let text = "${{ with foo as bar }}Hello!${{ endwith }}";
         let instructions = compile(text).unwrap();
         assert_eq!(3, instructions.len());
         assert_eq!(
@@ -561,7 +631,7 @@ mod test {
 
     #[test]
     fn test_foreach() {
-        let text = "{{ for foo in bar.baz }}{ foo }{{ endfor }}";
+        let text = "${{ for foo in bar.baz }}${ foo }${{ endfor }}";
         let instructions = compile(text).unwrap();
         assert_eq!(5, instructions.len());
         assert_eq!(
@@ -575,8 +645,68 @@ mod test {
     }
 
     #[test]
+    fn test_for_range_exclusive() {
+        let text = "${{ for i in 0..5 }}${ i }${{ endfor }}";
+        let instructions = compile(text).unwrap();
+        assert_eq!(5, instructions.len());
+        assert_eq!(
+            &PushRangeIterationContext {
+                start: 0,
+                end: 5,
+                inclusive: false,
+                name: "i"
+            },
+            &instructions[0]
+        );
+        assert_eq!(&Iterate(4), &instructions[1]);
+        assert_eq!(&Value(vec![PathStep::Name("i")]), &instructions[2]);
+        assert_eq!(&Goto(1), &instructions[3]);
+        assert_eq!(&PopContext, &instructions[4]);
+    }
+
+    #[test]
+    fn test_for_range_inclusive() {
+        let text = "${{ for i in 0..=3 }}${ i }${{ endfor }}";
+        let instructions = compile(text).unwrap();
+        assert_eq!(5, instructions.len());
+        assert_eq!(
+            &PushRangeIterationContext {
+                start: 0,
+                end: 3,
+                inclusive: true,
+                name: "i"
+            },
+            &instructions[0]
+        );
+        assert_eq!(&Iterate(4), &instructions[1]);
+        assert_eq!(&Value(vec![PathStep::Name("i")]), &instructions[2]);
+        assert_eq!(&Goto(1), &instructions[3]);
+        assert_eq!(&PopContext, &instructions[4]);
+    }
+
+    #[test]
+    fn test_for_range_negative() {
+        let text = "${{ for i in -2..2 }}${ i }${{ endfor }}";
+        let instructions = compile(text).unwrap();
+        assert_eq!(5, instructions.len());
+        assert_eq!(
+            &PushRangeIterationContext {
+                start: -2,
+                end: 2,
+                inclusive: false,
+                name: "i"
+            },
+            &instructions[0]
+        );
+        assert_eq!(&Iterate(4), &instructions[1]);
+        assert_eq!(&Value(vec![PathStep::Name("i")]), &instructions[2]);
+        assert_eq!(&Goto(1), &instructions[3]);
+        assert_eq!(&PopContext, &instructions[4]);
+    }
+
+    #[test]
     fn test_strip_whitespace_value() {
-        let text = "Hello,     {- name -}   , how are you?";
+        let text = "Hello,     ${- name -}   , how are you?";
         let instructions = compile(text).unwrap();
         assert_eq!(3, instructions.len());
         assert_eq!(&Literal("Hello,"), &instructions[0]);
@@ -586,12 +716,12 @@ mod test {
 
     #[test]
     fn test_strip_whitespace_block() {
-        let text = "Hello,     {{- if name -}}    {name}    {{- endif -}}   , how are you?";
+        let text = "Hello,     ${{- if name -}}    ${name}    ${{- endif -}}   , how are you?";
         let instructions = compile(text).unwrap();
         assert_eq!(6, instructions.len());
         assert_eq!(&Literal("Hello,"), &instructions[0]);
         assert_eq!(
-            &Branch(vec![PathStep::Name("name")], true, 5),
+            &Branch(vec![PathStep::Name("name")], None, true, 5),
             &instructions[1]
         );
         assert_eq!(&Literal(""), &instructions[2]);
@@ -602,7 +732,7 @@ mod test {
 
     #[test]
     fn test_comment() {
-        let text = "Hello, {# foo bar baz #} there!";
+        let text = "Hello, ${# foo bar baz #} there!";
         let instructions = compile(text).unwrap();
         assert_eq!(2, instructions.len());
         assert_eq!(&Literal("Hello, "), &instructions[0]);
@@ -611,7 +741,7 @@ mod test {
 
     #[test]
     fn test_strip_whitespace_comment() {
-        let text = "Hello, \t\n    {#- foo bar baz -#} \t  there!";
+        let text = "Hello, \t\n    ${#- foo bar baz -#} \t  there!";
         let instructions = compile(text).unwrap();
         assert_eq!(2, instructions.len());
         assert_eq!(&Literal("Hello,"), &instructions[0]);
@@ -620,7 +750,7 @@ mod test {
 
     #[test]
     fn test_strip_whitespace_followed_by_another_tag() {
-        let text = "{value -}{value} Hello";
+        let text = "${value -}${value} Hello";
         let instructions = compile(text).unwrap();
         assert_eq!(3, instructions.len());
         assert_eq!(&Value(vec![PathStep::Name("value")]), &instructions[0]);
@@ -630,7 +760,7 @@ mod test {
 
     #[test]
     fn test_call() {
-        let text = "{{ call my_macro with foo.bar }}";
+        let text = "${{ call my_macro with foo.bar }}";
         let instructions = compile(text).unwrap();
         assert_eq!(1, instructions.len());
         assert_eq!(
@@ -644,11 +774,11 @@ mod test {
 
     #[test]
     fn test_curly_brace_escaping() {
-        let text = "body \\{ \nfont-size: {fontsize} \n}";
+        let text = "body \\${ \nfont-size: ${fontsize} \n}";
         let instructions = compile(text).unwrap();
         assert_eq!(4, instructions.len());
         assert_eq!(&Literal("body "), &instructions[0]);
-        assert_eq!(&Literal("{ \nfont-size: "), &instructions[1]);
+        assert_eq!(&Literal("${ \nfont-size: "), &instructions[1]);
         assert_eq!(&Value(vec![PathStep::Name("fontsize")]), &instructions[2]);
         assert_eq!(&Literal(" \n}"), &instructions[3]);
     }
@@ -656,15 +786,15 @@ mod test {
     #[test]
     fn test_unclosed_tags() {
         let tags = vec![
-            "{",
-            "{ foo.bar",
-            "{ foo.bar\n }",
-            "{{",
-            "{{ if foo.bar",
-            "{{ if foo.bar \n}}",
-            "{#",
-            "{# if foo.bar",
-            "{# if foo.bar \n#}",
+            "${",
+            "${ foo.bar",
+            "${ foo.bar\n }",
+            "${{",
+            "${{ if foo.bar",
+            "${{ if foo.bar \n}}",
+            "${#",
+            "${# if foo.bar",
+            "${# if foo.bar \n#}",
         ];
         for tag in tags {
             compile(tag).unwrap_err();
@@ -673,29 +803,29 @@ mod test {
 
     #[test]
     fn test_mismatched_blocks() {
-        let text = "{{ if foo }}{{ with bar }}{{ endif }} {{ endwith }}";
+        let text = "${{ if foo }}${{ with bar }}${{ endif }} ${{ endwith }}";
         compile(text).unwrap_err();
     }
 
     #[test]
     fn test_disallows_invalid_keywords() {
-        let text = "{ @foo }";
+        let text = "${ @foo }";
         compile(text).unwrap_err();
     }
 
     #[test]
     fn test_diallows_unknown_block_type() {
-        let text = "{{ foobar }}";
+        let text = "${{ foobar }}";
         compile(text).unwrap_err();
     }
 
     #[test]
     fn test_parse_error_line_column_num() {
-        let text = "\n\n\n{{ foobar }}";
+        let text = "\n\n\n${{ foobar }}";
         let err = compile(text).unwrap_err();
         if let ParseError { line, column, .. } = err {
             assert_eq!(4, line);
-            assert_eq!(3, column);
+            assert_eq!(4, column);
         } else {
             panic!("Should have returned a parse error");
         }
@@ -703,17 +833,17 @@ mod test {
 
     #[test]
     fn test_parse_error_on_unclosed_if() {
-        let text = "{{ if foo }}";
+        let text = "${{ if foo }}";
         compile(text).unwrap_err();
     }
 
     #[test]
     fn test_parse_escaped_open_curly_brace() {
-        let text: &str = r"hello \{world}";
+        let text: &str = r"hello \${world}";
         let instructions = compile(text).unwrap();
         assert_eq!(2, instructions.len());
         assert_eq!(&Literal("hello "), &instructions[0]);
-        assert_eq!(&Literal("{world}"), &instructions[1]);
+        assert_eq!(&Literal("${world}"), &instructions[1]);
     }
 
     #[test]
@@ -724,7 +854,7 @@ mod test {
 
     #[test]
     fn test_mismatched_closing_tag() {
-        let text = "{#}";
+        let text = "${#}";
         compile(text).unwrap_err();
     }
 }

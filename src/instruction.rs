@@ -57,6 +57,16 @@ pub(crate) enum Instruction<'template> {
     /// This is always generated before an Iterate instruction which actually starts the iterator.
     PushIterationContext(Path<'template>, &'template str),
 
+    /// Push a range iteration context on the stack, shadowing the given name with the current value
+    /// from a numeric range. The range is defined by start, end, and whether it's inclusive.
+    /// This is always generated before an Iterate instruction which actually starts the iterator.
+    PushRangeIterationContext {
+        start: i64,
+        end: i64,
+        inclusive: bool,
+        name: &'template str,
+    },
+
     /// Pop a context off the stack
     PopContext,
 

@@ -41,7 +41,7 @@
 //!     name: String,
 //! }
 //!
-//! static TEMPLATE : &'static str = "Hello {name}!";
+//! static TEMPLATE : &'static str = "Hello ${name}!";
 //!
 //! pub fn main() -> Result<(), Box<Error>> {
 //!     let mut tt = TinyTemplate::new();
@@ -242,7 +242,7 @@ mod test {
         name: String,
     }
 
-    static TEMPLATE: &'static str = "Hello {name}!";
+    static TEMPLATE: &'static str = "Hello ${name}!";
 
     #[test]
     pub fn test_set_default_formatter() {
